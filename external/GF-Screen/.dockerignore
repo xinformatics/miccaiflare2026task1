@@ -1,0 +1,11 @@
+*
+!models/
+!models/*.py
+!utils/
+!utils/__init__.py
+!utils/utils.py
+!docker_submission/
+!docker_submission/Dockerfile
+!docker_submission/inference.py
+!docker_submission/predict.sh
+!docker_submission/model.pt

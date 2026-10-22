@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fine-tune the positive-unlabeled ResEnc parent on the isolated conservative
+# stomach/bladder pseudo set. This controller is fail-closed and staged.
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python_bin="/home/m348911/miniconda3/envs/radoncAI/bin/python"
+runner="${project_root}/nnunet/run_resenc_s6_organ_target.py"
+trainer_source="${project_root}/nnunet/resenc_s6_organ_target.py"
+authorization="${project_root}/nnunet/RESENC_S6_ORGAN_TARGET_AUTHORIZATION_20260827.json"
+preflight="${project_root}/nnunet/RESENC_S6_ORGAN_TARGET_PREFLIGHT_20260827.json"
+public_policy="${project_root}/nnunet/RESENC_S6_ORGAN_TARGET_PUBLIC_SELECTION_POLICY_20260827.json"
+build_marker="${project_root}/nnUNet_preprocessed/Dataset503_PanCancerOrganTarget/DATASET_BUILD_COMPLETE.json"
+preprocess_marker="${project_root}/nnUNet_preprocessed/Dataset503_PanCancerOrganTarget/PREPROCESSING_COMPLETE.json"
+plans="${project_root}/nnUNet_preprocessed/Dataset503_PanCancerOrganTarget/nnUNetPlans.json"
+dataset="${project_root}/nnUNet_preprocessed/Dataset503_PanCancerOrganTarget/dataset.json"
+cache="${project_root}/nnUNet_preprocessed/Dataset503_PanCancerOrganTarget/nnUNetPlans_3d_fullres_S4D2W32"
+positive_public="${project_root}/nnunet/public_sweeps/resenc_s6_positive_unlabeled_endpoints_20260827/TERMINAL.json"
+model="${project_root}/nnUNet_results/Dataset503_PanCancerOrganTarget/nnUNetTrainerResEncS6PanCancerOrganTarget__nnUNetPlans__3d_fullres_ResEncS6"
+fold="${model}/fold_all"
+latest="${fold}/checkpoint_latest.pth"
+final="${fold}/checkpoint_final.pth"
+work="${project_root}/nnunet/runs/resenc_s6_organ_target_f001_25ep_20260827"
+terminal="${work}/TRAINING_TERMINAL.json"
+public_root="${project_root}/nnunet/public_sweeps/resenc_s6_organ_target_endpoints_20260827"
+public_terminal="${public_root}/TERMINAL.json"
+public_unit="miccai-resenc-s6-organ-public-endpoints-20260827.service"
+stage_end_epochs=(10 25)
+
+mkdir -p "${work}"
+exec 9>"${work}/controller.lock"
+flock -n 9 || { echo "organ-target ResEnc controller already active" >&2; exit 1; }
+
+export CUDA_VISIBLE_DEVICES=0,1
+export nnUNet_raw="${project_root}/nnUNet_raw"
+export nnUNet_preprocessed="${project_root}/nnUNet_preprocessed"
+export nnUNet_results="${project_root}/nnUNet_results"
+export PYTHONPATH="${project_root}:${PYTHONPATH:-}"
+export MPLCONFIGDIR="${work}/.matplotlib"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_PROJECT="${WANDB_PROJECT:-pancancer-ct}"
+export PYTHONUNBUFFERED=1
+export nnUNet_n_proc_DA=0
+export nnUNet_compile=false
+export TORCHINDUCTOR_COMPILE_THREADS=1 MAX_JOBS=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export MALLOC_ARENA_MAX=2
+
+failure_line=unknown
+write_failure() {
+  local reason="$1"
+  "${python_bin}" - "${reason}" "${terminal}" <<'PY'
+import datetime,json,os,sys
+from pathlib import Path
+reason=sys.argv[1];output=Path(sys.argv[2])
+payload={"schema_version":1,"created_at":datetime.datetime.now().astimezone().isoformat(),
+ "status":"FAILED","reason":reason,"decision":"REPAIR_THEN_RESUME_EXACT_ORGAN_TARGET_RESENC",
+ "public_read":False,"hidden_read":False,"submission_created":False,"uploaded":False}
+temporary=output.with_name(f".{output.name}.{os.getpid()}.tmp")
+temporary.write_text(json.dumps(payload,indent=2)+"\n",encoding="utf-8");os.replace(temporary,output)
+PY
+}
+finalize() {
+  local status=$? line="${failure_line}"
+  trap - EXIT
+  if [[ "${status}" -ne 0 && ! -s "${terminal}" ]]; then
+    write_failure "organ-target ResEnc failed at line ${line}, status ${status}"
+  fi
+  exit "${status}"
+}
+trap 'failure_line=${LINENO}' ERR
+trap finalize EXIT
+
+for file in "${runner}" "${trainer_source}" "${authorization}" "${preflight}" \
+  "${public_policy}" "${build_marker}" "${preprocess_marker}" "${plans}" \
+  "${dataset}" "${positive_public}"; do
+  [[ -s "${file}" ]] || { echo "missing organ-target ResEnc input: ${file}" >&2; exit 2; }
+done
+[[ -d "${cache}" ]]
+
+parent=$("${python_bin}" - "${positive_public}" <<'PY'
+import json,sys
+from pathlib import Path
+p=json.load(open(sys.argv[1],encoding="utf-8"))
+if (p.get("status")!="COMPLETE" or p.get("hidden_read")
+    or p.get("submission_created") or p.get("uploaded")):
+    raise SystemExit("positive public selector is not safe and complete")
+row=p.get("selected") if isinstance(p.get("selected"),dict) else p.get("diagnostic_best")
+if not isinstance(row,dict) or not isinstance(row.get("checkpoint"),dict):
+    raise SystemExit("positive public selector has no parent checkpoint")
+print(Path(row["checkpoint"]["path"]).resolve())
+PY
+)
+[[ -s "${parent}" ]] || { echo "selected organ-target parent is missing: ${parent}" >&2; exit 2; }
+
+"${python_bin}" - "${project_root}" "${authorization}" "${preflight}" \
+  "${public_policy}" "${build_marker}" "${preprocess_marker}" "${plans}" \
+  "${dataset}" "${cache}" "${positive_public}" "${parent}" <<'PY'
+import hashlib,json,sys,torch
+from pathlib import Path
+root=Path(sys.argv[1])
+auth_path,preflight_path,policy_path,build_path,preprocess_path,plans_path,dataset_path,cache,positive_public_path,parent_path=map(Path,sys.argv[2:])
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+auth=json.load(open(auth_path,encoding="utf-8"))
+if (auth.get("status")!="AUTHORIZED"
+    or auth.get("decision")!="QUEUE_ORGAN_TARGET_RESENC_ONLY_AFTER_STANDARD_POSITIVE_BRANCH"
+    or auth.get("child",{}).get("epochs")!=25
+    or auth.get("child",{}).get("initial_lr")!=3e-5
+    or auth.get("child",{}).get("global_batch_size")!=16
+    or auth.get("supervision",{}).get("organ_target_cases")!=4
+    or auth.get("supervision",{}).get("organ_target_components")!=5
+    or auth.get("supervision",{}).get("organ_target_case_exposure")!=0.01
+    or auth.get("supervision",{}).get("rejected_or_unselected_unlabeled_cases")!="excluded_unknown_not_negative"
+    or auth.get("public_used_for_training") or auth.get("hidden_used_for_training")):
+    raise SystemExit("invalid organ-target ResEnc authorization")
+preflight=json.load(open(preflight_path,encoding="utf-8"))
+if (preflight.get("status")!="PASS" or preflight.get("gpu_used")
+    or preflight.get("dataset",{}).get("identifier_count")!=17579
+    or preflight.get("dataset",{}).get("identifier_sha256")!="1df4a798cb3acf4b674d90f5ea1120cdb0fb08fb481319c289f339daa57d0991"
+    or preflight.get("tests",{}).get("total_passed")!=13
+    or preflight.get("public_read") or preflight.get("hidden_read")):
+    raise SystemExit("invalid organ-target ResEnc preflight")
+for item in preflight.get("code",{}).values():
+    path=root/item["path"]
+    if sha(path)!=item["sha256"]:
+        raise SystemExit(f"organ-target code hash mismatch: {path}")
+policy=json.load(open(policy_path,encoding="utf-8"));qualification=policy.get("selection",{}).get("qualification",{})
+if (policy.get("status")!="PREDECLARED_BEFORE_TRAINING"
+    or policy.get("checkpoint_epochs")!=[10,25]
+    or qualification.get("minimum_fixed_public_DSC")!=0.6366639257651584
+    or qualification.get("minimum_fixed_public_NSD")!=0.5347520263176905
+    or policy.get("threshold_search_after_public_read") is not False
+    or policy.get("public_used_for_training") or policy.get("hidden_read")):
+    raise SystemExit("invalid organ-target public-selection policy")
+build=json.load(open(build_path,encoding="utf-8"))
+if (build.get("status")!="COMPLETE" or build.get("labeled_cases")!=17575
+    or build.get("organ_target_cases")!=4 or build.get("organ_target_components")!=5
+    or build.get("total_cases")!=17579
+    or build.get("public_read") or build.get("hidden_read")):
+    raise SystemExit("invalid Dataset503 build marker")
+preprocess=json.load(open(preprocess_path,encoding="utf-8"))
+if (preprocess.get("status")!="COMPLETE" or preprocess.get("total_cases")!=17579
+    or preprocess.get("organ_target_preprocessed_cases")!=4
+    or preprocess.get("build_marker",{}).get("sha256")!=sha(build_path)
+    or preprocess.get("positive_public_selector",{}).get("sha256")!=sha(positive_public_path)
+    or preprocess.get("public_read") or preprocess.get("hidden_read")):
+    raise SystemExit("invalid Dataset503 preprocessing marker")
+plans=json.load(open(plans_path,encoding="utf-8"));dataset=json.load(open(dataset_path,encoding="utf-8"))
+c=plans["configurations"]["3d_fullres_ResEncS6"]
+if (plans.get("dataset_name")!="Dataset503_PanCancerOrganTarget"
+    or c.get("data_identifier")!="nnUNetPlans_3d_fullres_S4D2W32"
+    or c.get("patch_size")!=[128,160,160] or c.get("spacing")!=[2.4,1.6,1.6]
+    or dataset.get("numTraining")!=17579):
+    raise SystemExit("Dataset503 plan contract changed")
+data={p.name.removesuffix(".b2nd") for p in cache.glob("*.b2nd") if not p.name.endswith("_seg.b2nd")}
+seg={p.name.removesuffix("_seg.b2nd") for p in cache.glob("*_seg.b2nd")}
+properties={p.name.removesuffix(".pkl") for p in cache.glob("*.pkl")}
+if len(data)!=17579 or data!=seg or data!=properties:
+    raise SystemExit("Dataset503 cache triplet inventory mismatch")
+target={name for name in data if name.startswith("PseudoOrgan-")}
+if target!={f"PseudoOrgan-AMOS22_{i:04d}" for i in range(1,5)}:
+    raise SystemExit("Dataset503 organ-target cache inventory mismatch")
+positive_public=json.load(open(positive_public_path,encoding="utf-8"))
+row=positive_public.get("selected") if isinstance(positive_public.get("selected"),dict) else positive_public.get("diagnostic_best")
+if (positive_public.get("status")!="COMPLETE" or not isinstance(row,dict)
+    or Path(row.get("checkpoint",{}).get("path","")).resolve()!=parent_path.resolve()
+    or row.get("checkpoint",{}).get("sha256")!=sha(parent_path)
+    or positive_public.get("hidden_read") or positive_public.get("submission_created")
+    or positive_public.get("uploaded")):
+    raise SystemExit("invalid positive public parent selector")
+parent=torch.load(parent_path,map_location="cpu",weights_only=False)
+if (parent.get("trainer_name")!="nnUNetTrainerResEncS6PanCancerPositiveUnlabeled"
+    or int(parent.get("current_epoch",-1)) not in {25,50,100}
+    or not isinstance(parent.get("network_weights"),dict)):
+    raise SystemExit("invalid parent ResEnc checkpoint")
+PY
+
+if [[ -s "${terminal}" ]]; then
+  status=$("${python_bin}" -c 'import json,sys;print(json.load(open(sys.argv[1]))["status"])' "${terminal}")
+  case "${status}" in
+    COMPLETE) trap - EXIT; exit 0 ;;
+    FAILED) mv --no-clobber "${terminal}" "${work}/TRAINING_TERMINAL.failed_retry_$(date +%Y%m%dT%H%M%S%N).json" ;;
+    *) echo "unexpected organ-target terminal status: ${status}" >&2; exit 2 ;;
+  esac
+fi
+
+if ! systemctl --user is-active --quiet "${public_unit}"; then
+  echo "staged organ-target ResEnc requires the public endpoint service: ${public_unit}" >&2
+  exit 2
+fi
+
+checkpoint_epoch() {
+  local checkpoint="$1"
+  "${python_bin}" - "${checkpoint}" <<'PY'
+import sys,torch
+x=torch.load(sys.argv[1],map_location="cpu",weights_only=False)
+if (x.get("trainer_name")!="nnUNetTrainerResEncS6PanCancerOrganTarget"
+    or not isinstance(x.get("network_weights"),dict)
+    or not isinstance(x.get("optimizer_state"),dict)):
+    raise SystemExit("invalid organ-target optimizer-resume checkpoint")
+print(int(x.get("current_epoch",-1)))
+PY
+}
+
+for stage_end in "${stage_end_epochs[@]}"; do
+  stage4=$(printf '%04d' "${stage_end}")
+  landmark="${fold}/checkpoint_epoch_${stage4}.pth"
+  [[ "${stage_end}" -eq 25 ]] && landmark="${final}"
+  endpoint_terminal="${public_root}/epoch_${stage4}/ENDPOINT_TERMINAL.json"
+
+  current=0
+  resume_checkpoint=""
+  for candidate in "${final}" "${latest}"; do
+    [[ -s "${candidate}" ]] || continue
+    candidate_epoch=$(checkpoint_epoch "${candidate}")
+    if (( candidate_epoch > current )); then
+      current="${candidate_epoch}"
+      resume_checkpoint="${candidate}"
+    fi
+  done
+  if [[ -z "${resume_checkpoint}" && -e "${fold}" ]]; then
+    [[ -z "$(find "${fold}" -mindepth 1 -maxdepth 1 -print -quit)" ]] || {
+      echo "nonempty organ-target fold exists without a resumable checkpoint" >&2
+      exit 2
+    }
+  fi
+  if (( current > stage_end )); then
+    [[ -s "${landmark}" ]] || {
+      echo "missing organ-target endpoint ${stage_end} behind epoch ${current}" >&2
+      exit 2
+    }
+  elif (( current < stage_end )); then
+    export RESENC_ORGAN_STAGE_END_EPOCH="${stage_end}"
+    export PANCANCER_AUGMENTATION_SEED_OFFSET="$((current * 1000000))"
+    launch_args=()
+    if [[ -n "${resume_checkpoint}" ]]; then
+      launch_args=(--c)
+    else
+      launch_args=(-pretrained_weights "${parent}")
+    fi
+    printf '%s starting organ-target ResEnc stage %s from epoch %s\n' \
+      "$(date -Ins)" "${stage_end}" "${current}" | tee -a "${work}/stage_controller.log"
+    "${python_bin}" -u "${runner}" Dataset503_PanCancerOrganTarget \
+      3d_fullres_ResEncS6 all \
+      -tr nnUNetTrainerResEncS6PanCancerOrganTarget -p nnUNetPlans \
+      "${launch_args[@]}" -num_gpus 2 >>"${work}/train.log" 2>&1
+  fi
+
+  [[ -s "${landmark}" ]]
+  observed=$(checkpoint_epoch "${landmark}")
+  [[ "${observed}" -eq "${stage_end}" ]] || {
+    echo "organ-target endpoint checkpoint mismatch: ${observed} != ${stage_end}" >&2
+    exit 2
+  }
+  landmark_sha=$(sha256sum "${landmark}" | awk '{print $1}')
+  printf '%s waiting for hash-bound organ-target public endpoint %s\n' \
+    "$(date -Ins)" "${stage_end}" | tee -a "${work}/stage_controller.log"
+  while :; do
+    if [[ -s "${endpoint_terminal}" ]] && "${python_bin}" - \
+      "${endpoint_terminal}" "${landmark_sha}" "${stage_end}" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding="utf-8"));sha=sys.argv[2];epoch=int(sys.argv[3])
+if (p.get("status")!="COMPLETE" or p.get("epoch")!=epoch
+    or p.get("checkpoint",{}).get("sha256")!=sha
+    or p.get("case_count")!=50 or p.get("dataset_role")!="public"
+    or p.get("hidden_read") or p.get("submission_created") or p.get("uploaded")):
+    raise SystemExit(1)
+PY
+    then break; fi
+    if [[ -s "${public_terminal}" ]]; then
+      public_status=$("${python_bin}" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("status",""))' "${public_terminal}")
+      [[ "${public_status}" != FAILED ]] || {
+        echo "organ-target fixed-public endpoint controller failed" >&2
+        exit 2
+      }
+    fi
+    sleep 30
+  done
+done
+
+unset RESENC_ORGAN_STAGE_END_EPOCH PANCANCER_AUGMENTATION_SEED_OFFSET
+[[ -s "${final}" ]]
+"${python_bin}" - "${final}" "${parent}" "${plans}" "${dataset}" \
+  "${trainer_source}" "${runner}" "${authorization}" "${preflight}" \
+  "${public_policy}" "${terminal}" <<'PY'
+import datetime,hashlib,json,os,sys,torch
+from pathlib import Path
+final,parent,plans,dataset,trainer,runner,authorization,preflight,policy,output=map(Path,sys.argv[1:])
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+x=torch.load(final,map_location="cpu",weights_only=False)
+if (x.get("trainer_name")!="nnUNetTrainerResEncS6PanCancerOrganTarget"
+    or int(x.get("current_epoch",-1))!=25 or not isinstance(x.get("optimizer_state"),dict)):
+    raise SystemExit("invalid organ-target final checkpoint")
+payload={"schema_version":1,"created_at":datetime.datetime.now().astimezone().isoformat(),
+ "status":"COMPLETE","model":"nnU-Net v2 ResidualEncoderUNet S6 organ-target fine-tune",
+ "recipe":{"parameters":107467050,"epochs":25,"initial_lr":3e-5,
+   "optimizer":"fresh SGD Nesterov momentum 0.99","schedule":"polynomial",
+   "schedule_horizon_epochs":25,"staged_public_endpoints":[10,25],
+   "optimizer_state_preserved_between_stages":True,
+   "augmentation_seed_policy":"base_2026082600_plus_stage_start_epoch_times_1000000_plus_ddp_rank_times_100000",
+   "loss":"component-box CE plus Tversky a025 b075; outside boxes ignored",
+   "physical_gpus":[0,1],"global_batch_size":16,"labeled_cases":17575,
+   "organ_target_cases":4,"organ_target_components":5,
+   "organ_target_exposure":0.01,
+   "target_organs":["stomach","urinary_bladder"],
+   "rejected_or_unselected_unlabeled_cases":"excluded_unknown_not_negative"},
+ "final_checkpoint":{"path":str(final.resolve()),"sha256":sha(final)},
+ "parent_checkpoint":{"path":str(parent.resolve()),"sha256":sha(parent)},
+ "plans":{"path":str(plans.resolve()),"sha256":sha(plans)},
+ "dataset":{"path":str(dataset.resolve()),"sha256":sha(dataset)},
+ "trainer_source":{"path":str(trainer.resolve()),"sha256":sha(trainer)},
+ "runner":{"path":str(runner.resolve()),"sha256":sha(runner)},
+ "authorization":{"path":str(authorization.resolve()),"sha256":sha(authorization)},
+ "preflight":{"path":str(preflight.resolve()),"sha256":sha(preflight)},
+ "public_policy":{"path":str(policy.resolve()),"sha256":sha(policy)},
+ "public_read":False,"hidden_read":False,"submission_created":False,"uploaded":False}
+temporary=output.with_name(f".{output.name}.{os.getpid()}.tmp")
+temporary.write_text(json.dumps(payload,indent=2)+"\n",encoding="utf-8");os.replace(temporary,output)
+PY
+
+trap - EXIT

@@ -1,0 +1,35 @@
+FROM mayo-stunet-compat-probe:torch113
+
+LABEL org.opencontainers.image.title="Mayo Clinic PanCancer CT Segmentation" \
+      org.opencontainers.image.vendor="Mayo Clinic" \
+      org.opencontainers.image.description="Evaluation-contract ablation image derived from mrigroupopbg/mri-python3"
+
+WORKDIR /workspace
+COPY assets /workspace/assets
+COPY nnUNet_results /workspace/nnUNet_results
+COPY external /workspace/external
+COPY deployment_inference.py predict.sh /workspace/
+
+RUN chmod 755 /workspace/predict.sh /workspace/deployment_inference.py && \
+    find /workspace/external -type f -name '*.py' -exec chmod 755 {} +
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/workspace/external/GF-Screen/docker_submission/vendor:/workspace/external/GF-Screen:/workspace/external/BiomedParse/container_workspace:/workspace/external/STU-Net/pancancer \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=2 \
+    nnUNet_compile=false \
+    MAYO_ABLATION=gf \
+    MAYO_FOCUS_BATCH_SIZE=4 \
+    MAYO_GLANCE_BATCH_SIZE=8 \
+    MAYO_BIOMED_BATCH_SIZE=4 \
+    MAYO_CROP_OVERLAP=0.75 \
+    MAYO_LESION_THRESHOLD=0.60 \
+    MAYO_ADAPTIVE_SELECTED_THRESHOLD=300
+
+CMD ["/bin/bash"]

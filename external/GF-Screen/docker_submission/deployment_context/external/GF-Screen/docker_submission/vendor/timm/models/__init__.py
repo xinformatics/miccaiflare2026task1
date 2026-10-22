@@ -1,0 +1,2 @@
+"""Minimal timm.models namespace."""
+

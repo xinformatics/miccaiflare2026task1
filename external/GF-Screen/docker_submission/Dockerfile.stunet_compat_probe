@@ -1,0 +1,48 @@
+FROM mayo-biomed-compat-probe:torch113
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# nnU-Net 2.4 is the first release line matching the checkpoint's modern plan
+# schema. Its inference code is exercised against the challenge's pinned
+# torch 1.13 stack; training-only dependencies and torch upgrades are excluded.
+RUN python -m pip install --no-cache-dir --no-deps \
+      acvl-utils==0.2.2 \
+      batchgenerators==0.25.1 \
+      blosc2==2.2.7 \
+      dynamic-network-architectures==0.3.1 \
+      scikit-image==0.21.0 \
+      yacs==0.1.8 \
+      graphviz==0.20.3 \
+      imagecodecs==2023.3.16 \
+      tifffile==2023.7.10 \
+      connected-components-3d==3.12.4
+
+RUN python -m pip install --no-cache-dir --no-deps \
+      future==1.0.0 \
+      imageio==2.35.1 \
+      lazy-loader==0.4 \
+      msgpack==1.0.8 \
+      ndindex==1.8 \
+      pandas==1.5.3 \
+      PyWavelets==1.4.1 \
+      py-cpuinfo==9.0.0 \
+      threadpoolctl==3.5.0
+
+RUN python -m pip install --no-cache-dir --no-deps --ignore-requires-python \
+      nnunetv2==2.4.2
+
+# 2.4.2's inference code is compatible with Python 3.8, but several modules
+# eagerly evaluate PEP-585 annotations and therefore declare Python >=3.9.
+# Postponing annotations is a syntax-preserving compatibility backport.
+RUN while IFS= read -r source; do \
+      if ! grep -q '^from __future__ import annotations$' "${source}"; then \
+        sed -i '1i from __future__ import annotations' "${source}"; \
+      fi; \
+    done < <(find /usr/local/lib/python3.8/site-packages/nnunetv2 -type f -name '*.py' -print)
+
+ENV nnUNet_compile=false \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1
+
+CMD ["python", "--version"]

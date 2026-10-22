@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace="/mnt/nvme2-data/shashank/MICCAI26"
+root="${workspace}/external/BiomedParse"
+gf="${workspace}/external/GF-Screen"
+python_bin="/home/m348911/miniconda3/envs/radoncAI/bin/python"
+direct="${root}/public_sweeps/automatic_text_proposals_20260820"
+combined="${root}/public_sweeps/combined_prompt_confirmation_20260820"
+output="${root}/public_sweeps/component16_biomedparse_confirmation_20260820"
+base="${gf}/public_sweeps/completed_bbox_variants_20260820/scored/component16_ep283_lesion_0.60_mm1000"
+labels="${workspace}/validation/Validation-Public-Labels"
+champion="${gf}/public_sweeps/gf_a055_bbox_ep280_focus_thresholds/scored/lesion_0.50_mm1000.metrics.csv"
+component16="${gf}/public_sweeps/completed_bbox_variants_20260820/scored/component16_ep283_lesion_0.60_mm1000.metrics.csv"
+wait_pid="${WAIT_PID:-1111260}"
+
+[[ "${wait_pid}" =~ ^[0-9]+$ ]] || { echo "WAIT_PID must be numeric" >&2; exit 1; }
+while kill -0 "${wait_pid}" 2>/dev/null; do sleep 10; done
+[[ $(find "${base}" -maxdepth 1 -name '*.nii.gz' | wc -l) -eq 50 ]] || {
+  echo "component16 public base is incomplete" >&2
+  exit 1
+}
+[[ $(find "${combined}/supports/union_e050" -maxdepth 1 -name '*.nii.gz' | wc -l) -eq 50 ]] || {
+  echo "combined OR support is incomplete" >&2
+  exit 1
+}
+
+mkdir -p "${output}/scored"
+screen="${output}/screen"
+if [[ -s "${screen}/screen.json" && ! -s "${screen}/shortlist.tsv" ]]; then
+  "${python_bin}" -u "${root}/biomedparse_fusion.py" resume-screen \
+    --screen-json "${screen}/screen.json" --output "${screen}" --workers 4 \
+    > "${output}/screen.resume.log" 2>&1
+elif [[ ! -s "${screen}/screen.json" ]]; then
+  "${python_bin}" -u "${root}/biomedparse_fusion.py" screen \
+    --base "${base}" \
+    --support "whole_e050=${direct}/whole_body_lesion_e050_nifti" \
+    --support "prompt_or_e050=${combined}/supports/union_e050" \
+    --kind confirm --include-top-k-rescue \
+    --labels "${labels}" --output "${screen}" --workers 4 \
+    > "${output}/screen.log" 2>&1
+fi
+
+candidate_args=()
+while IFS=$'\t\r' read -r _ _ _ _ _ _ tag _ _ _ _ _ _ _ predictions; do
+  candidate_args+=(--candidate "${tag}=${predictions}")
+done < <(tail -n +2 "${screen}/shortlist.tsv")
+"${python_bin}" -u "${gf}/evaluate_public_grid.py" --gt "${labels}" \
+  --output-dir "${output}/scored" --workers 8 "${candidate_args[@]}" \
+  > "${output}/exact_grid.score.log" 2>&1
+
+printf 'tag\tsupport\tscreen_DSC\tDSC\tNSD\tcombined\tmetrics\tpredictions\tconfig\n' \
+  > "${output}/summary.tsv"
+while IFS=$'\t\r' read -r support _ _ _ _ _ tag screen_dsc _ _ _ _ _ config predictions; do
+  metrics="${output}/scored/${tag}.metrics.csv"
+  dsc=$(awk -F, 'NR > 1 {sum += $2; n++} END {printf "%.4f", sum/n}' "${metrics}")
+  nsd=$(awk -F, 'NR > 1 {sum += $3; n++} END {printf "%.4f", sum/n}' "${metrics}")
+  combined_score=$(awk -v d="${dsc}" -v n="${nsd}" 'BEGIN {printf "%.6f", (d+n)/2}')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${tag}" "${support}" "${screen_dsc}" "${dsc}" "${nsd}" \
+    "${combined_score}" "${metrics}" "${predictions}" "${config}" >> "${output}/summary.tsv"
+done < <(tail -n +2 "${screen}/shortlist.tsv")
+{ head -1 "${output}/summary.tsv"; \
+  tail -n +2 "${output}/summary.tsv" | sort -t $'\t' -k6,6gr; } \
+  > "${output}/summary_by_combined.tsv"
+
+best=$(sed -n '2p' "${output}/summary_by_combined.tsv")
+IFS=$'\t' read -r tag _ _ _ _ _ metrics _ _ <<< "${best}"
+"${python_bin}" "${gf}/select_checkpoint_robust.py" \
+  --anchor "${champion}" --candidate "${metrics}" \
+  --anchor-name gf_bbox_champion --candidate-name "component16_${tag}" \
+  --output "${output}/robust_vs_champion.json" > "${output}/robust_vs_champion.log"
+"${python_bin}" "${gf}/select_checkpoint_robust.py" \
+  --anchor "${component16}" --candidate "${metrics}" \
+  --anchor-name component16_ep283 --candidate-name "component16_${tag}" \
+  --output "${output}/robust_vs_component16.json" > "${output}/robust_vs_component16.log"
+cat "${output}/summary_by_combined.tsv"
+cat "${output}/robust_vs_champion.json"
